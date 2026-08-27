@@ -106,7 +106,7 @@ audio_preprocessing:
   chunk_output_path: chunks/
 
 audio_util:
-  max_size_mb: 300
+  max_size_mb: 3000
   allowed_extensions:
     - .wav
     - .mp3
@@ -121,6 +121,7 @@ va_pipeline:
   plugin_path: components/va
   rtsp_codec: h264 # h264 or h265
   output_rtsp_url: rtsp://127.0.0.1:8554
+  completion_timeout_sec: 3600
   hls_base_url: http://127.0.0.1:8888
   webrtc_base_url: http://127.0.0.1:8889
   stream_protocol: webrtc # webrtc or hls
