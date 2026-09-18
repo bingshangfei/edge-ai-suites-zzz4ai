@@ -664,10 +664,10 @@ _active_pipeline: Optional["BoardOCRPipeline"] = None
 
 
 def default_board_ocr_output_dir(session_id: str) -> Path:
-    """<Project.location>/<Project.name>/<session_id>/board_ocr"""
-    from utils.artifacts.path import get_artifact_path
+    """<Project.location>/<Project.name>/<session_id>/raw/board_ocr"""
+    from utils.session_paths import SessionPaths
 
-    return Path(get_artifact_path(session_id, "board_ocr"))
+    return SessionPaths.board_ocr_dir(session_id)
 
 
 def _configured_source() -> str:
