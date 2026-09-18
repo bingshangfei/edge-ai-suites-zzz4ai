@@ -13,7 +13,7 @@ from typing import Optional
 
 from utils.runtime_config_loader import RuntimeConfig
 from utils.storage_manager import StorageManager
-from utils.artifacts.path import get_session_dir, get_artifact_path
+from utils.session_paths import SessionPaths
 from utils.config_loader import config
 from utils.session_state_manager import SessionState
 
@@ -25,16 +25,12 @@ MAX_DIFFICULTY_POINTS = 4
 MIN_SPEECH_SAMPLE_SEC = 30
 
 
-def _get_session_dir(session_id: str) -> str:
-    return get_session_dir(session_id)
-
-
 class DataCollector:
     """Reads all available session data for report generation."""
 
     def __init__(self, session_id: str):
         self.session_id = session_id
-        self.session_dir = _get_session_dir(session_id)
+        self.raw_dir = str(SessionPaths.raw_dir(session_id))
         self.raw_metrics = {}
         self.max_keywords, self.max_difficulty_points = self._load_report_limits()
 
@@ -95,7 +91,7 @@ class DataCollector:
     def _read_class_statistics(self) -> Optional[str]:
         self.raw_metrics["video_source_count"] = self._count_video_sources()
 
-        stats_file = get_artifact_path(self.session_id, "va", "class_statistics.json")
+        stats_file = str(SessionPaths.class_statistics_path(self.session_id))
         if not os.path.exists(stats_file):
             return None
 
@@ -126,20 +122,21 @@ class DataCollector:
         directly into the always-on ``video_source_count`` field, never guessed by
         the LLM. Returns 0 when no video analytics ran.
         """
+        va_dir = str(SessionPaths.va_dir(self.session_id))
         markers = ("front_posture.txt", "back_posture.txt", "content_results.txt")
-        return sum(1 for m in markers if os.path.exists(get_artifact_path(self.session_id, "va", m)))
+        return sum(1 for m in markers if os.path.exists(os.path.join(va_dir, m)))
 
     def _has_audio(self) -> bool:
         """True when this session produced an audio transcript."""
         for fname in ("teacher_transcription.txt", "content_segmentation_transcription.txt"):
-            if os.path.exists(os.path.join(self.session_dir, fname)):
+            if os.path.exists(os.path.join(self.raw_dir, fname)):
                 return True
         return bool(SessionState.get_session_state(self.session_id).get("has_audio"))
 
     def _audio_duration_sec(self) -> float:
         """Audio timeline length from the transcript's last end timestamp (seconds)."""
         for fname in ("content_segmentation_transcription.txt", "teacher_transcription.txt"):
-            path = os.path.join(self.session_dir, fname)
+            path = os.path.join(self.raw_dir, fname)
             if not os.path.exists(path):
                 continue
             content = StorageManager.read_text_file(path)
@@ -153,7 +150,7 @@ class DataCollector:
 
     def _video_duration_sec(self) -> float:
         """Video length persisted by VA into class_statistics.json (seconds)."""
-        stats_file = os.path.join(self.session_dir, "va", "class_statistics.json")
+        stats_file = str(SessionPaths.class_statistics_path(self.session_id))
         if not os.path.exists(stats_file):
             return 0.0
         content = StorageManager.read_text_file(stats_file)
@@ -204,7 +201,7 @@ class DataCollector:
         return duration_min
 
     def _read_class_summary(self) -> Optional[str]:
-        summary_path = get_artifact_path(self.session_id, "summary.md")
+        summary_path = str(SessionPaths.summary_path(self.session_id))
         if not os.path.exists(summary_path):
             return None
 
@@ -249,7 +246,7 @@ class DataCollector:
 
         haystack_parts = []
         for fname in ("teacher_transcription.txt", "ocr_result.txt"):
-            path = get_artifact_path(self.session_id, fname)
+            path = os.path.join(self.raw_dir, fname)
             if os.path.exists(path):
                 text = StorageManager.read_text_file(path)
                 if text:
@@ -394,7 +391,7 @@ class DataCollector:
         return sep.join(items)
 
     def _read_mindmap(self) -> Optional[str]:
-        mindmap_path = get_artifact_path(self.session_id, "mindmap.mmd")
+        mindmap_path = str(SessionPaths.mindmap_path(self.session_id))
         if not os.path.exists(mindmap_path):
             return None
 
@@ -405,7 +402,7 @@ class DataCollector:
         return f"Mind map (node_tree JSON):\n{content}"
 
     def _read_topic_segmentation(self) -> Optional[str]:
-        topics_path = get_artifact_path(self.session_id, "topics.json")
+        topics_path = str(SessionPaths.topics_path(self.session_id))
         if not os.path.exists(topics_path):
             return None
 
@@ -416,7 +413,7 @@ class DataCollector:
         return f"Topic segmentation:\n{content}"
 
     def _read_teacher_transcription(self) -> Optional[str]:
-        path = get_artifact_path(self.session_id, "teacher_transcription.txt")
+        path = str(SessionPaths.teacher_transcript_path(self.session_id))
         if not os.path.exists(path):
             return None
 
@@ -492,7 +489,7 @@ class DataCollector:
         return f"Teacher transcription analysis:\n{stats}\nSample:\n{sample}"
 
     def _read_content_segmentation(self) -> Optional[str]:
-        path = get_artifact_path(self.session_id, "content_segmentation_transcription.txt")
+        path = str(SessionPaths.segmentation_transcript_path(self.session_id))
         if not os.path.exists(path):
             return None
 

@@ -1,14 +1,18 @@
 import os
-import io
 import json, csv
-from threading import Thread
+import time
+from threading import Thread, Lock
 from typing import Union, List, Dict, Tuple
 from pathlib import Path
 import logging
 
-from utils.artifacts.pending_writes import PendingWrites
+from utils.session_paths import SessionPaths
 
 logger = logging.getLogger(__name__)
+
+_inflight_lock = Lock()
+_inflight = 0
+
 
 class StorageManager:
     @staticmethod
@@ -30,30 +34,18 @@ class StorageManager:
         return [data]  # Always return list
 
     @staticmethod
-    def _render_payload(path: str, data: Union[str, dict], append: bool) -> str:
-        if isinstance(data, dict):
-            merged = StorageManager._prepare_json_data(path, data, append)
-            return json.dumps(merged, indent=2, ensure_ascii=False)
-
-        if append and os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read() + data
-        return data
-
-    @staticmethod
-    def _atomic_write_text(path: str, payload: str, newline: str = ""):
-        tmp_path = f"{path}.tmp"
-        with open(tmp_path, "w", newline=newline, encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-
-    @staticmethod
     def _write(path: str, data: Union[str, dict], append: bool):
         StorageManager._ensure_dir(path)
-        payload = StorageManager._render_payload(path, data, append)
-        StorageManager._atomic_write_text(path, payload)
+
+        if isinstance(data, dict):
+            data = StorageManager._prepare_json_data(path, data, append)
+            # Always overwrite to maintain valid JSON
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        else:
+            mode = 'a' if append else 'w'
+            with open(path, mode, encoding="utf-8") as f:
+                f.write(data)
 
     @staticmethod
     def save(path: str, data: Union[str, dict], append: bool = False):
@@ -61,62 +53,78 @@ class StorageManager:
 
     @staticmethod
     def save_async(path: str, data: Union[str, dict], append: bool = False):
-        PendingWrites.inc()
+        global _inflight
+        with _inflight_lock:
+            _inflight += 1
 
         def _run():
+            global _inflight
             try:
                 StorageManager._write(path, data, append)
             finally:
-                PendingWrites.dec()
+                with _inflight_lock:
+                    _inflight -= 1
 
         Thread(target=_run).start()
-        
+
+    @staticmethod
+    def wait_idle(timeout: float = 30.0) -> bool:
+        """Block until all async writes have flushed, or timeout elapses.
+
+        Returns True if writes drained, False on timeout. Used to barrier
+        between pipeline stages so a stage never reads a file the previous
+        stage is still writing.
+        """
+        waited = 0.0
+        while waited < timeout:
+            with _inflight_lock:
+                if _inflight == 0:
+                    return True
+            time.sleep(0.1)
+            waited += 0.1
+        return False
+
+
     @staticmethod
     def save_csv(path: str, data: dict, headers: List[str], append: bool = True):
         StorageManager._ensure_dir(path)
+        # Write headers only if file doesn't exist or append==False
+        if not os.path.exists(path) or not append:
+            with open(path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writeheader()
 
-        existing_rows = []
-        if append and os.path.exists(path):
-            with open(path, "r", newline="", encoding="utf-8") as f:
-                existing_rows = list(csv.DictReader(f))
-
-        buffer = io.StringIO()
-        writer = csv.DictWriter(buffer, fieldnames=headers)
-        writer.writeheader()
-        writer.writerows(existing_rows)
-        writer.writerow(data)
-        StorageManager._atomic_write_text(path, buffer.getvalue())
+        with open(path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writerow(data)
 
     @staticmethod
     def update_csv(path: str, new_data: Dict[str, Union[str, int, float]]):
         StorageManager._ensure_dir(path)
 
         rows = []
-        headers = list(new_data.keys())
+        headers = set(new_data.keys())
 
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 rows = list(reader)
                 for row in rows:
-                    for key in row.keys():
-                        if key not in headers:
-                            headers.append(key)
+                    headers.update(row.keys())
 
         if rows:
             rows[0].update(new_data)
         else:
             rows = [new_data]
 
-        buffer = io.StringIO()
-        writer = csv.DictWriter(buffer, fieldnames=headers)
-        writer.writeheader()
-        writer.writerows(rows)
-        StorageManager._atomic_write_text(path, buffer.getvalue())
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(headers))
+            writer.writeheader()
+            writer.writerows(rows)
             
     @staticmethod
     def read_performance_metrics(project_location: str, project_name: str, session_id: str) -> dict:
-        metrics_csv = os.path.join(project_location, project_name, session_id, "performance_metrics.csv")
+        metrics_csv = str(SessionPaths.metrics_path(session_id))
 
         if not os.path.exists(metrics_csv):
             return {}

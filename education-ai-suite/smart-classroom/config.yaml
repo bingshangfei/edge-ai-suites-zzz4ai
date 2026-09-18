@@ -1,8 +1,7 @@
 ﻿app:
   name: Smart Classroom
   cleanup_on_exit: true
-  use_ov_genai: True # True or False, applicable for provider: openvino
-  language: zh # en or zh
+  language: en # en or zh
 
 features:
   asr:                { enabled: true }
@@ -11,18 +10,10 @@ features:
   topic_segmentation: { enabled: true }
   video_analytics:    { enabled: true }
   board_ocr:          { enabled: true }
-  content_search:     { enabled: false }
-  qa:                 { enabled: false }
+  content_search:     { enabled: true }
+  qa:                 { enabled: true }
   grading:            { enabled: false }
-  report:             { enabled: false }
-
-output_layout:
-  result_dir: result
-  raw_dir: raw
-  logs_dir: logs
-
-backup:
-  quiet_seconds: 60
+  report:             { enabled: true }
 
 monitoring:
   logs_dir: ./monitoring/logs
@@ -33,8 +24,8 @@ monitoring:
 
 models:
   asr:
-    provider: funasr # openvino, funasr and openai supported
-    name: paraformer-zh  # can be (whisper-base, whisper-small etc) or paraformer-zh
+    provider: openai # openvino, funasr and openai supported
+    name: whisper-small  # can be (whisper-base, whisper-small etc) or paraformer-zh
     device: CPU # CPU Recommended
     temperature: 0.0
     diarization: False # requires manual HF token setup, see docs/user-guide/advance-setup-guide.md#f-speaker-diarization-setup-optional
@@ -46,21 +37,17 @@ models:
     min_duration_sec: 0.25
     min_words: 2
     max_chars_per_segment: 0  # cap characters per merged transcript segment; set to 0 or Null to disable merging entirely
+    concurrency: 1    # CapabilityRunner max_concurrency (single warm pipe)
+    queue_max: 8      # CapabilityRunner queue depth before 503 backpressure
   
   diarization: #Only applicable when diarization is set to True for ASR
+    backend: pyannote  # pyannote, or campplus for funasr/paraformer-zh
     provider: "huggingface"
     name: "pyannote/speaker-diarization-community-1"
     models_base_path: "models"
+    global_speaker_similarity_threshold: 0.65
 
   summarizer:
-    provider: openvino 
-    name: Qwen/Qwen3-8B 
-    device: GPU # GPU or CPU
-    weight_format: int4 # supports fp16, int4, int8 (Recommended)
-    max_new_tokens: 5120
-    temperature: 0.0 # 0.5 default
-    use_cache: True
-    models_base_path: "models"
     mode: dialog   # dialog | teacher | hybrid
 
   model_hub: huggingface # huggingface or modelscope
@@ -95,18 +82,32 @@ models:
     concurrency: 1    # CapabilityRunner max_concurrency (single warm pipe)
     queue_max: 8      # CapabilityRunner queue depth before 503 backpressure
 
+    chunking:
+      enabled: true                  # false = summarize the whole transcript in one pass
+      max_prompt_tokens: auto        # auto = min(quality ceiling, memory ceiling); an int overrides both
+      max_content_tokens: 24000      # quality ceiling
+      gpu_memory_safety_margin: 0.6  # memory ceiling
+      map_max_new_tokens: 1536       # length cap for each per-segment note
+
+    segmentation:
+      window_max_new_tokens: 1024
+      topics_target: 20
+      topics_min: 15
+      topics_max: 25
+
 mindmap:
   min_token: 20
 
 audio_preprocessing:
-  chunk_duration_sec: 15
+  chunking: true # false: transcribe and diarize the whole recording in one pass, funasr/paraformer-zh only
+  chunk_duration_sec: 30
   silence_threshold: -35  # in dB
   silence_duration: 0.3   # minimum silence length in seconds
   search_window_sec: 1    # how far to look for silence if no silence exactly at chunk boundary
   chunk_output_path: chunks/
 
 audio_util:
-  max_size_mb: 3000
+  max_size_mb: 800
   allowed_extensions:
     - .wav
     - .mp3
@@ -163,23 +164,18 @@ content_search:
     video_max_mb: 1024      # maximum upload size for videos (MB)
 
   vlm:
-    model_name: "Qwen/Qwen3-VL-8B-Instruct"
     host_addr: "127.0.0.1"
     port: 8000  # warm VLM now hosted by main app (:8000); standalone :9900 retired
-    device: "GPU"
-    weight_format: "int8"
-    ingest_enabled: true
-    stream: false  
 
   video_preprocess:
     host_addr: "127.0.0.1"
     port: 8001
-    vlm_timeout_seconds: 300
+    vlm_timeout_seconds: 600
+    max_completion_tokens: 500
     chunk_duration_s: 30
     chunk_overlap_s: 4
     max_num_frames: 8
-    frame_width: 0
-    frame_height: 0
+    max_image_pixels: 1048576  # downscale frames above this area (px) before sending to VLM
 
   file_ingest:
     host_addr: "127.0.0.1"
@@ -209,7 +205,7 @@ content_search:
     max_tokens: 1024        # maximum tokens the VLM can generate for an answer (prevents mid-sentence cutoff)
     max_history_turns: 3    # number of prior conversation turns (user+assistant pairs) sent to the VLM
     context_window: 16384   # token budget for dynamic context selection; 
-    retrieval_score_threshold: 85  # minimum relevance score (0-100) a chunk must have to be used as context
+    retrieval_score_threshold: 60  # minimum relevance score (0-100) a chunk must have to be used as context
 
 # ── Telegram integration (OpenClaw bridge) ────────────────────────────────────
 # Set enabled: true and fill in bot_token + chat_id to activate.

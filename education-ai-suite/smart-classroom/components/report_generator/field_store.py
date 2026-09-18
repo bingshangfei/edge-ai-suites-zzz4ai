@@ -16,7 +16,6 @@ import json
 import logging
 
 from utils.storage_manager import StorageManager
-from utils.artifacts.path import get_artifact_path
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +26,12 @@ def store_path(session_dir: str) -> str:
     return os.path.join(session_dir, FIELDS_FILENAME)
 
 
-def load_store(session_id: str) -> dict:
+def load_store(session_dir: str) -> dict:
     """Load the session field cache as ``{"fields": {code: value}}``.
 
     Returns an empty cache (never raises) when the file is absent or corrupt.
     """
-    path = get_artifact_path(session_id, FIELDS_FILENAME)
+    path = store_path(session_dir)
     if not os.path.exists(path):
         return {"fields": {}}
     try:
@@ -45,10 +44,10 @@ def load_store(session_id: str) -> dict:
     return data
 
 
-def save_store(session_id: str, fields: dict) -> None:
+def save_store(session_dir: str, fields: dict) -> None:
     """Persist the full-catalog ``fields`` cache for the session."""
     StorageManager.save(
-        get_artifact_path(session_id, FIELDS_FILENAME),
+        store_path(session_dir),
         json.dumps({"fields": fields}, ensure_ascii=False, indent=2),
         append=False,
     )

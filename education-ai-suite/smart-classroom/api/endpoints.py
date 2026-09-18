@@ -14,18 +14,18 @@ import subprocess, re
 from fastapi.responses import StreamingResponse
 from utils.runtime_config_loader import RuntimeConfig
 from utils.storage_manager import StorageManager
-from utils.artifacts.path import get_session_dir, get_artifact_path
-from utils import session_state, orchestrator
+from utils.session_paths import SessionPaths
 from utils.platform_info import get_platform_and_model_info
 from dto.project_settings import ProjectSettings
 from monitoring.monitor import start_monitoring, stop_monitoring, get_metrics
 from dto.audiosource import AudioSource
 from components.ffmpeg import audio_preprocessing
 from utils.audio_util import save_audio_file
-from utils.locks import audio_pipeline_lock, video_analytics_lock
+from utils.locks import video_analytics_lock
 from components.va.va_pipeline_service import VideoAnalyticsPipelineService, PipelineOptions
 from components.va.media_service import ensure_media_service_running
-from utils.session_manager import generate_session_id
+from utils.pipeline_catalog import FEATURE_STAGE
+from utils.session_manager import PATH_SAFE_SESSION_ID, generate_session_id
 from dto.search_dto import SearchRequest
 from utils.session_state_manager import SessionState
 from dto.ocr_dto import OCRExtractRequest, OCRResponse
@@ -38,9 +38,27 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-@router.get("/create-session")
-def create_session():
-    return JSONResponse(content={"session-id":  generate_session_id()}, status_code=200)
+
+def _set_va_stage(session_id, status: str, detail: str | None = None) -> None:
+    """Record the video-analytics stage, both on the session row and as an event."""
+    if not session_id:
+        return
+    stage = FEATURE_STAGE["video_analytics"]
+    try:
+        from utils.stage_tracker import stage_finished, stage_started
+        if status == "running":
+            stage_started(session_id, stage)
+        else:
+            stage_finished(
+                session_id, stage, status,
+                error_class="VideoAnalyticsError" if detail else None,
+                error_detail=detail,
+            )
+    except Exception:
+        logger.warning(
+            f"[stage] {session_id} {stage}: failed to record '{status}'", exc_info=True
+        )
+
 
 @router.get("/health")
 def health():
@@ -48,72 +66,9 @@ def health():
     hub = ModelManager.instance().health()
     return JSONResponse(content={"status": "ok", "hub": hub}, status_code=200)
 
-
-@router.get("/sessions")
-def list_sessions():
-    sessions = []
-    for state in session_state.SessionStateManager.list_all():
-        sessions.append(
-            {
-                "session_id": state.get("session_id"),
-                "state": state.get("state"),
-                "current_stage": state.get("current_stage"),
-                "stages": state.get("stages"),
-                "sources": state.get("sources"),
-                "started_at": state.get("started_at"),
-                "updated_at": state.get("updated_at"),
-            }
-        )
-    return JSONResponse(content={"total": len(sessions), "sessions": sessions}, status_code=200)
-
-
-@router.post("/sessions/process")
-def process_session(payload: dict):
-    stages = payload.get("stages") or []
-    if not stages:
-        raise HTTPException(status_code=400, detail="stages required")
-    _validate_stages(stages)
-    session_id = orchestrator.start_process(payload)
-    state = session_state.SessionStateManager.get(session_id)
-    return JSONResponse(
-        content={
-            "session_id": session_id,
-            "stages": state.get("stages") if state else stages,
-            "output_dir": os.path.abspath(get_session_dir(session_id)),
-            "started_at": state.get("started_at") if state else None,
-        },
-        status_code=200,
-    )
-
-
-@router.get("/sessions/{session_id}/status")
-def get_session_progress(session_id: str):
-    state = session_state.SessionStateManager.get(session_id)
-    if state is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    return JSONResponse(content=_status_response(state), status_code=200)
-
-
-def _validate_stages(stages: list) -> None:
-    from utils.session_state import _ALL_STAGES
-    for s in stages:
-        if s not in _ALL_STAGES:
-            raise HTTPException(status_code=400, detail=f"unknown stage: {s}")
-
-
-def _status_response(state: dict) -> dict:
-    return {
-        "session_id": state.get("session_id"),
-        "state": state.get("state"),
-        "current_stage": state.get("current_stage"),
-        "stages": state.get("stages"),
-        "sources": state.get("sources"),
-        "output_dir": os.path.abspath(get_session_dir(state.get("session_id"))),
-        "error": state.get("error"),
-        "started_at": state.get("started_at"),
-        "updated_at": state.get("updated_at"),
-    }
-
+@router.get("/create-session")
+def create_session():
+    return JSONResponse(content={"session-id":  generate_session_id()}, status_code=200)
 
 @router.get("/features")
 def get_features(request: Request):
@@ -136,6 +91,7 @@ def get_features(request: Request):
         descriptor = feature.ui_descriptor()
         descriptor["dependency"] = list(feature.depends_on)
         descriptor["requires"] = list(feature.requires)
+        descriptor["stage"] = feature.stage
         features.append(descriptor)
 
     return JSONResponse(
@@ -186,15 +142,15 @@ def update_project_config(payload: ProjectSettings):
     return RuntimeConfig.update_section("Project", updates)
 
 @router.post("/start-monitoring")
-def start_monitoring_endpoint( x_session_id: Optional[str] = Header(None)):
-    start_monitoring(get_artifact_path(x_session_id, "utilization_logs"))
+def start_monitoring_endpoint( x_session_id: Optional[str] = Header(None, pattern=PATH_SAFE_SESSION_ID)):
+    start_monitoring(str(SessionPaths.utilization_logs_dir(x_session_id)))
     return JSONResponse(content={"status": "success", "message": "Monitoring started"})
 
 @router.get("/metrics")
-def get_metrics_endpoint(x_session_id: Optional[str] = Header(None)):
+def get_metrics_endpoint(x_session_id: Optional[str] = Header(None, pattern=PATH_SAFE_SESSION_ID)):
     if x_session_id is None or "":
         return ""
-    return get_metrics(get_artifact_path(x_session_id, "utilization_logs"))
+    return get_metrics(str(SessionPaths.utilization_logs_dir(x_session_id)))
 
 @router.get("/platform-info")
 def get_platform_info():
@@ -217,16 +173,19 @@ va_services = {}  # {session_id: VideoAnalyticsPipelineService}
 def start_video_analytics_pipeline(
     http_request: Request,
     requests: list[VideoAnalyticsRequest],
-    x_session_id: Optional[str] = Header(None),
+    x_session_id: Optional[str] = Header(None, pattern=PATH_SAFE_SESSION_ID),
 ):
     """
     Start one or more video analytics pipelines
 
     Args:
-        requests: List of VideoAnalyticsRequest with pipeline_name, source
+        requests: List of VideoAnalyticsRequest with pipeline_name, source,
+            output_stream. When output_stream is False, that pipeline's video
+            is discarded and no stream URL is returned for it.
 
     Returns:
         JSON array with HLS/WebRTC stream addresses for each pipeline
+        (stream addresses omitted when output_stream is False)
     """
     if not x_session_id:
         raise HTTPException(
@@ -260,7 +219,11 @@ def start_video_analytics_pipeline(
             ensure_media_service_running()
 
             if x_session_id not in va_services:
-                output_dir = get_artifact_path(x_session_id, "va")
+                project_config = RuntimeConfig.get_section("Project")
+                location = project_config.get("location", "outputs")
+                name = project_config.get("name", "default")
+
+                output_dir = str(SessionPaths.va_dir(x_session_id))
                 os.makedirs(output_dir, exist_ok=True)
 
                 va_services[x_session_id] = VideoAnalyticsPipelineService()
@@ -268,12 +231,26 @@ def start_video_analytics_pipeline(
 
                 # ── Register callback: fires when ALL pipelines finish (EOS or manual stop) ──
                 _sid      = x_session_id
-                def _on_all_pipelines_done(session_id, _svc=va_services[x_session_id]):
+                _location = location
+                _pname    = name
+                def _on_all_pipelines_done(session_id, _svc=va_services[x_session_id],
+                                           _loc=_location, _n=_pname):
                     from utils.scp_sender import write_engagement_reports, get_scp_sender
                     from utils.telegram_sender import get_sender
+                    # "stopped" is the teacher ending the recording and "eos" is
+                    # a file source running out - both are normal ends. Only
+                    # every pipeline failing makes the stage a failure.
+                    _statuses = list((_svc.pipeline_final_status or {}).values())
+                    _finished_ok = any(s in ("eos", "stopped") for s in _statuses)
+                    _set_va_stage(
+                        session_id,
+                        "done" if _finished_ok else "failed",
+                        None if _finished_ok
+                        else f"no pipeline ended normally; final statuses: {_statuses}",
+                    )
                     try:
-                        _session_dir     = get_session_dir(session_id)
-                        _front_posture   = get_artifact_path(session_id, "va", "front_posture.txt")
+                        _session_dir     = str(SessionPaths.session_dir(session_id))
+                        _front_posture   = str(SessionPaths.va_dir(session_id) / "front_posture.txt")
                         # Use the same engine as the /class-statistics UI endpoint
                         va_stats, _ = _svc.get_pose_stats(_front_posture)
 
@@ -288,7 +265,7 @@ def start_video_analytics_pipeline(
                         logger.info(f"[VA done] Final stats for {session_id}: {va_stats}")
 
                         try:
-                            _stats_path = get_artifact_path(session_id, "va", "class_statistics.json")
+                            _stats_path = str(SessionPaths.class_statistics_path(session_id))
                             os.makedirs(os.path.dirname(_stats_path), exist_ok=True)
                             with open(_stats_path, "w", encoding="utf-8") as _fh:
                                 json.dump(va_stats, _fh, indent=2, ensure_ascii=False)
@@ -332,7 +309,10 @@ def start_video_analytics_pipeline(
 
             # Prepare pipeline options
             from utils.config_loader import config
-            output_dir = get_artifact_path(x_session_id, "va")
+            project_config = RuntimeConfig.get_section("Project")
+            location = project_config.get("location", "outputs")
+            name = project_config.get("name", "default")
+            output_dir = str(SessionPaths.va_dir(x_session_id))
 
             options = PipelineOptions(
                 output_dir=output_dir,
@@ -358,6 +338,7 @@ def start_video_analytics_pipeline(
                     pipe_options = PipelineOptions(
                         output_dir=options.output_dir,
                         output_rtsp=options.output_rtsp,
+                        output_stream=req.output_stream,
                         threshold=options.threshold,
                         record=record,
                     )
@@ -376,18 +357,21 @@ def start_video_analytics_pipeline(
                             "error": f"Failed to start pipeline '{req.pipeline_name}'",
                         }
                     else:
-                        if config.va_pipeline.stream_protocol == "webrtc":
-                            stream_url = f"{config.va_pipeline.webrtc_base_url}/{req.pipeline_name}_stream"
-                        else:
-                            stream_url = f"{config.va_pipeline.hls_base_url}/{req.pipeline_name}_stream"
-                        return {
+                        result = {
                             "status": "success",
                             "pipeline_name": req.pipeline_name,
                             "session_id": x_session_id,
-                            "stream_url": stream_url,
-                            "stream_protocol": config.va_pipeline.stream_protocol,
-                            "overlays_embedded": True,
+                            "output_stream": req.output_stream,
                         }
+                        if req.output_stream:
+                            if config.va_pipeline.stream_protocol == "webrtc":
+                                stream_url = f"{config.va_pipeline.webrtc_base_url}/{req.pipeline_name}_stream"
+                            else:
+                                stream_url = f"{config.va_pipeline.hls_base_url}/{req.pipeline_name}_stream"
+                            result["stream_url"] = stream_url
+                            result["stream_protocol"] = config.va_pipeline.stream_protocol
+                            result["overlays_embedded"] = True
+                        return result
                 except Exception as e:
                     logger.error(f"Error starting pipeline '{req.pipeline_name}': {e}")
                     return {
@@ -409,6 +393,17 @@ def start_video_analytics_pipeline(
                     for i, req in enumerate(requests)
                 ]
                 results = [f.result() for f in futures]
+
+            # VA is the one stage stage_tracker cannot wrap: it spans two
+            # endpoints rather than one call. Mark it here, and mark it finished
+            # from on_all_pipelines_done above - the single point every exit
+            # route converges on, whether the pipelines hit EOS or were stopped.
+            if any(r.get("status") == "success" for r in results):
+                _set_va_stage(x_session_id, "running")
+            else:
+                _set_va_stage(
+                    x_session_id, "failed", "no video-analytics pipeline could be launched"
+                )
 
             # Board OCR: bring up the twin pipeline for the content source.
             # It reads the source directly, so start it even if the VA content
@@ -436,7 +431,7 @@ def start_video_analytics_pipeline(
 
 @router.post("/stop-video-analytics-pipeline")
 def stop_video_analytics_pipeline(
-    requests: list[VideoAnalyticsRequest], x_session_id: Optional[str] = Header(None)
+    requests: list[VideoAnalyticsRequest], x_session_id: Optional[str] = Header(None, pattern=PATH_SAFE_SESSION_ID)
 ):
     """
     Stop one or more video analytics pipelines
@@ -532,8 +527,11 @@ def stop_video_analytics_pipeline(
             # ── Telegram: Package B+C (Q2 engagement + Q4 participation) ────
             # Triggered once all stop requests for this session are processed.
             # Uses front_posture.txt for video stats; transcription.txt for audio.
-            session_dir     = get_session_dir(x_session_id)
-            va_posture_file = get_artifact_path(x_session_id, "va", "front_posture.txt")
+            project_config = RuntimeConfig.get_section("Project")
+            location = project_config.get("location", "outputs")
+            name     = project_config.get("name", "default")
+            session_dir     = str(SessionPaths.session_dir(x_session_id))
+            va_posture_file = str(SessionPaths.va_dir(x_session_id) / "front_posture.txt")
             sender = get_sender()
             if sender:
                 sender.send_engagement_package_async(
@@ -552,7 +550,7 @@ def stop_video_analytics_pipeline(
 
 @router.get("/monitor-video-analytics-pipeline")
 async def monitor_video_analytics_pipeline_status(
-    x_session_id: Optional[str] = Header(None)
+    x_session_id: Optional[str] = Header(None, pattern=PATH_SAFE_SESSION_ID)
 ):
     """
     Monitor all video analytics pipelines status with streaming response
@@ -583,7 +581,7 @@ async def monitor_video_analytics_pipeline_status(
     return StreamingResponse(stream_status(), media_type="application/json")
 
 @router.get("/class-statistics")
-async def get_class_statistics(x_session_id: Optional[str] = Header(None)):
+async def get_class_statistics(x_session_id: Optional[str] = Header(None, pattern=PATH_SAFE_SESSION_ID)):
     """
     Get class statistics with real-time streaming updates
 
@@ -612,8 +610,11 @@ async def get_class_statistics(x_session_id: Optional[str] = Header(None)):
     service = va_services[x_session_id]
 
     # Get the front_posture.txt file path
-    output_dir = get_artifact_path(x_session_id, "va")
-    front_posture_file = os.path.join(output_dir, "front_posture.txt")
+    project_config = RuntimeConfig.get_section("Project")
+    location = project_config.get("location", "outputs")
+    name = project_config.get("name", "default")
+    output_dir = str(SessionPaths.va_dir(x_session_id))
+    front_posture_file = str(SessionPaths.va_dir(x_session_id) / "front_posture.txt")
 
     async def stream_statistics():
         stats_state = None  # Will hold the state for incremental processing
@@ -783,7 +784,7 @@ def search_content(request: SearchRequest):
         )
 
 @router.get("/check-recorded-videos")
-def check_recorded_videos(x_session_id: Optional[str] = Header(None)):
+def check_recorded_videos(x_session_id: Optional[str] = Header(None, pattern=PATH_SAFE_SESSION_ID)):
     """
     Check which video files were saved for a session after RTSP recording.
     Returns the priority-ordered available video (back > board > front).
@@ -795,10 +796,15 @@ def check_recorded_videos(x_session_id: Optional[str] = Header(None)):
         )
     
     try:
-        session_root = get_session_dir(x_session_id)
-
-        if not os.path.exists(session_root):
-            logger.warn(f"Session path does not exist: {session_root}")
+        project_config = RuntimeConfig.get_section("Project")
+        base_path = os.path.join(
+            project_config.get("location"),
+            project_config.get("name"),
+            x_session_id
+        )
+        
+        if not os.path.exists(base_path):
+            logger.warn(f"Session path does not exist: {base_path}")
             return JSONResponse(
                 content={
                     "session_id": x_session_id,
@@ -818,9 +824,9 @@ def check_recorded_videos(x_session_id: Optional[str] = Header(None)):
             "front": None,
         }
         
-        back_path = get_artifact_path(x_session_id, "back.mp4")
-        content_path = get_artifact_path(x_session_id, "content.mp4")
-        front_path = get_artifact_path(x_session_id, "front.mp4")
+        back_path = os.path.join(base_path, "back.mp4")
+        content_path = os.path.join(base_path, "content.mp4") 
+        front_path = os.path.join(base_path, "front.mp4")
         
         if os.path.exists(back_path):
             videos["back"] = back_path
@@ -855,7 +861,7 @@ def check_recorded_videos(x_session_id: Optional[str] = Header(None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/recorded-video/{videoType}")
-def get_recorded_video(videoType: str, x_session_id: Optional[str] = Header(None), session_id: Optional[str] = None):
+def get_recorded_video(videoType: str, x_session_id: Optional[str] = Header(None, pattern=PATH_SAFE_SESSION_ID), session_id: Optional[str] = None):
     """
     Stream a recorded video file (back.mp4, board.mp4, or front.mp4).
 
@@ -875,7 +881,13 @@ def get_recorded_video(videoType: str, x_session_id: Optional[str] = Header(None
     try:
         backend_video_type = "content" if videoType == "board" else videoType
         
-        video_path = get_artifact_path(actual_session_id, f"{backend_video_type}.mp4")
+        project_config = RuntimeConfig.get_section("Project")
+        video_path = os.path.join(
+            project_config.get("location"),
+            project_config.get("name"),
+            actual_session_id,
+            f"{backend_video_type}.mp4"
+        )
         
         if not os.path.exists(video_path):
             raise HTTPException(
@@ -908,11 +920,14 @@ def ocr_detect_file_endpoint(file: UploadFile = File(...)):
 
 
 @router.post("/ocr/extract-text", response_model=OCRResponse)
-def ocr_extract_text_endpoint(file: UploadFile = File(...), x_session_id: Optional[str] = Header(None)):
+def ocr_extract_text_endpoint(file: UploadFile = File(...), x_session_id: Optional[str] = Header(None, pattern=PATH_SAFE_SESSION_ID)):
     return ocr_extract_text(file, x_session_id)
 
 def register_routes(app: FastAPI):
     app.include_router(router)
+
+    from api.v1.api import v1_router
+    app.include_router(v1_router, prefix="/api/v1")
 
     from api.vlm_chat import router as vlm_chat_router
     app.include_router(vlm_chat_router)

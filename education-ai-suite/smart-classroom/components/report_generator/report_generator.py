@@ -21,8 +21,7 @@ from components.report_generator.prompts import (
 from utils.config_loader import config
 from utils.runtime_config_loader import RuntimeConfig
 from utils.storage_manager import StorageManager
-from utils.artifacts.path import get_session_dir, get_artifact_path
-from utils.locks import audio_pipeline_lock
+from utils.session_paths import SessionPaths
 from components.report_generator.template_manager import (
     get_template_path,
     extract_template_structure,
@@ -72,7 +71,8 @@ class ReportGenerator:
         self.collected_by_source = {}
 
     def _get_session_dir(self) -> str:
-        return get_session_dir(self.session_id)
+        """Directory holding this session's generated deliverables."""
+        return str(SessionPaths.result_dir(self.session_id))
 
     def _collect_all_data(self):
         """Deterministically collect all available session data."""
@@ -91,8 +91,8 @@ class ReportGenerator:
                 self.collected_data.append(f"[{source_name}] {result}")
                 self.collected_by_source[source_name] = result
 
-    def _build_generated_fill_prompt(self, template_structure: dict, gen_codes: list, raw_values: dict) -> str:
-        """Build the split-fill prompt asking the LLM for ONLY the generated fields.
+    def _build_generated_fill_messages(self, template_structure: dict, gen_codes: list, raw_values: dict) -> list:
+        """Build the split-fill chat history asking the LLM for ONLY the generated fields.
 
         Measured raw values are passed as Known Facts for grounding but are not
         requested back from the model.
@@ -126,13 +126,10 @@ class ReportGenerator:
                 field_definitions=field_definitions,
             )
 
-        messages = [
+        return [
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_content},
         ]
-        return self.model.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
 
     def generate_report(self):
         """
@@ -141,16 +138,6 @@ class ReportGenerator:
         """
         if self.model is None:
             raise RuntimeError("ReportGenerator requires a model instance.")
-
-        if audio_pipeline_lock.locked():
-            busy_msg = (
-                "当前音频处理正在进行中，请等待转录/摘要完成后再生成报告。"
-                if self.language == "zh"
-                else "Audio processing is in progress. Please wait for transcription/summary to complete."
-            )
-            logger.warning("[ReportGenerator] audio_pipeline_lock is held, refusing to start.")
-            yield {"type": "token", "content": busy_msg}
-            return
 
         start = time.perf_counter()
 
@@ -172,7 +159,7 @@ class ReportGenerator:
             return
 
         session_dir = self._get_session_dir()
-        report_path = get_artifact_path(self.session_id, "class_report.md")
+        report_path = os.path.join(session_dir, "class_report.md")
 
         template_path = get_template_path(self.language, self.session_id, self.template_name)
         if template_path is None:
@@ -206,17 +193,15 @@ class ReportGenerator:
 
         from components.report_generator.template_manager import read_docx_as_markdown
 
-        docx_path = get_artifact_path(self.session_id, "class_report.docx")
-
         if gen_codes:
             pending = "⏳ 生成中…" if self.language == "zh" else "⏳ Generating…"
             interim_fields = {**{c: pending for c in gen_codes}, **raw_values}
             fill_template(template_path, interim_fields,
-                          docx_path,
+                          os.path.join(session_dir, "class_report.docx"),
                           drop_codes=drop_codes, image_fields=image_fields,
                           field_codes=frozenset(get_known_field_codes()))
             interim_md = read_docx_as_markdown(
-                docx_path,
+                os.path.join(session_dir, "class_report.docx"),
                 self.session_id,
             )
             yield {"type": "partial_report", "content": interim_md}
@@ -229,11 +214,13 @@ class ReportGenerator:
         # resolved and stay intact, so the teacher keeps a usable report.
         na_placeholder = "无数据" if self.language == "zh" else "N/A"
         if gen_codes:
-            gen_prompt = self._build_generated_fill_prompt(structure, gen_codes, raw_values)
+            gen_messages = self._build_generated_fill_messages(structure, gen_codes, raw_values)
             llm_failed = False
             json_response = None
             try:
-                json_response = self.model.generate(gen_prompt, stream=False)
+                json_response = self.model.generate(
+                    messages=gen_messages, stream=False, enable_thinking=False
+                )
                 if isinstance(json_response, str) and json_response.startswith("[ERROR]:"):
                     raise RuntimeError(json_response)
             except RuntimeError as e:
@@ -259,8 +246,9 @@ class ReportGenerator:
             logger.info("[ReportGenerator] No generated fields; skipping LLM.")
 
         report_fields = {**llm_values, **raw_values}
-        save_store(self.session_id, report_fields)
+        save_store(session_dir, report_fields)
 
+        docx_path = os.path.join(session_dir, "class_report.docx")
         fill_template(template_path, report_fields, docx_path,
                       drop_codes=drop_codes, image_fields=image_fields,
                       field_codes=frozenset(get_known_field_codes()))
@@ -282,7 +270,7 @@ class ReportGenerator:
         )
 
         StorageManager.update_csv(
-            path=get_artifact_path(self.session_id, "performance_metrics.csv"),
+            path=str(SessionPaths.metrics_path(self.session_id)),
             new_data={
                 "performance.report_collect_time": round(collect_time, 4),
                 "performance.report_generation_time": round(generation_time, 4),
@@ -309,7 +297,7 @@ class ReportGenerator:
         if template_path is None:
             raise RuntimeError("No report template available to render.")
 
-        fields = dict(load_store(self.session_id).get("fields", {}))
+        fields = dict(load_store(session_dir).get("fields", {}))
         if not fields:
             raise RuntimeError("No cached fields for this session. Generate a report first.")
 
@@ -319,16 +307,16 @@ class ReportGenerator:
         manual = self._manual_values()
         if manual:
             fields.update(manual)
-            save_store(self.session_id, fields)
+            save_store(session_dir, fields)
 
         image_fields = self._build_image_fields(selected)
 
-        docx_path = get_artifact_path(self.session_id, "class_report.docx")
+        docx_path = os.path.join(session_dir, "class_report.docx")
         fill_template(template_path, fields, docx_path,
                       drop_codes=drop_codes, image_fields=image_fields,
                       field_codes=frozenset(get_known_field_codes()))
         markdown_content = read_docx_as_markdown(docx_path, self.session_id)
-        StorageManager.save(get_artifact_path(self.session_id, "class_report.md"),
+        StorageManager.save(os.path.join(session_dir, "class_report.md"),
                             markdown_content, append=False)
 
         logger.info(f"[ReportGenerator] Re-projected selection for session "
@@ -405,7 +393,8 @@ class ReportGenerator:
         """
         image_fields = {}
         if "mindmap" in selected:
-            png = get_artifact_path(self.session_id, "mindmap_report.png")
+            session_dir = self._get_session_dir()
+            png = os.path.join(session_dir, "mindmap_report.png")
             if os.path.exists(png):
                 image_fields["mindmap"] = png
         return image_fields

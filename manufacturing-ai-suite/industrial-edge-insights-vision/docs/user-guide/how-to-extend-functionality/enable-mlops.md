@@ -8,7 +8,7 @@ With this feature, during runtime, you can download a new model using the micros
 ### Prerequisites
 
 This guide assumes that Model Download service has already downloaded the model to be updated to `/tmp/models`.
-To learn how to setup Model Download, see [here](https://docs.openedgeplatform.intel.com/dev/edge-ai-libraries/model-download/get-started.html#start-with-setup-script).
+Make sure to [set up Model Download](https://docs.openedgeplatform.intel.com/dev/edge-ai-libraries/model-download/get-started.html#start-with-setup-script) first.
 
 If not available, you can simulate this by downloading the appropriate sample model from the Edge AI Resources repository by using the link from the tabs below. Once downloaded, extract to `/tmp/models` directory.
 
@@ -66,8 +66,8 @@ hide_directive-->
    ```sh
    HOST_IP= # <IP Address of the host machine>
 
-   MINIO_ACCESS_KEY=   # MinIO service & client access key e.g. intel1234
-   MINIO_SECRET_KEY=   # MinIO service & client secret key e.g. intel1234
+   S3_STORAGE_USERNAME=   # SeaweedFS S3 service & client access key e.g. intel1234
+   S3_STORAGE_PASSWORD=   # SeaweedFS S3 service & client secret key e.g. intel1234
 
    MTX_WEBRTCICESERVERS2_0_USERNAME=  # Webrtc-mediamtx username. e.g intel1234
    MTX_WEBRTCICESERVERS2_0_PASSWORD=  # Webrtc-mediamtx password. e.g intel1234
